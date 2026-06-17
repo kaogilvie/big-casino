@@ -27,7 +27,7 @@ from app.sources.base import parse_date
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(_PROJECT_ROOT, "data", "portfolio.duckdb")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -44,14 +44,15 @@ CREATE TABLE IF NOT EXISTS accounts (
 -- return are preserved. A position = the sum of its lots for (account_id, symbol).
 CREATE SEQUENCE IF NOT EXISTS holdings_lot_seq START 1;
 CREATE TABLE IF NOT EXISTS holdings (
-    lot_id          BIGINT  DEFAULT nextval('holdings_lot_seq') PRIMARY KEY,
-    account_id      VARCHAR NOT NULL,
-    symbol          VARCHAR NOT NULL,
-    quantity        DOUBLE  NOT NULL,
-    cost_per_share  DOUBLE  NOT NULL,
-    purchase_date   DATE,
-    source          VARCHAR,
-    imported_at     TIMESTAMP
+    lot_id           BIGINT  DEFAULT nextval('holdings_lot_seq') PRIMARY KEY,
+    account_id       VARCHAR NOT NULL,
+    symbol           VARCHAR NOT NULL,
+    quantity         DOUBLE  NOT NULL,
+    cost_per_share   DOUBLE  NOT NULL,
+    purchase_date    DATE,
+    cost_basis_type  VARCHAR NOT NULL DEFAULT 'lot',
+    source           VARCHAR,
+    imported_at      TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS balances (
@@ -156,14 +157,42 @@ def replace_holdings(con, account_ids: Iterable[str], holdings: Iterable[Holding
         pdate = parse_date(h.purchase_date) if h.purchase_date else None
         rows.append(
             (h.account_id, h.symbol, float(h.quantity), float(h.cost_per_share),
-             pdate, h.source, now)
+             pdate, h.cost_basis_type, h.source, now)
         )
     if rows:
         con.executemany(
             """
             INSERT INTO holdings
-                (account_id, symbol, quantity, cost_per_share, purchase_date, source, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (account_id, symbol, quantity, cost_per_share, purchase_date,
+                 cost_basis_type, source, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def append_holdings(con, holdings: Iterable[Holding]) -> int:
+    """Insert lots without clearing anything — additive (for manual entry).
+
+    Unlike `replace_holdings`, this never deletes existing lots, so entering one
+    new buy adds it to the account rather than wiping the rest.
+    """
+    now = datetime.now()
+    rows = []
+    for h in holdings:
+        pdate = parse_date(h.purchase_date) if h.purchase_date else None
+        rows.append(
+            (h.account_id, h.symbol, float(h.quantity), float(h.cost_per_share),
+             pdate, h.cost_basis_type, h.source, now)
+        )
+    if rows:
+        con.executemany(
+            """
+            INSERT INTO holdings
+                (account_id, symbol, quantity, cost_per_share, purchase_date,
+                 cost_basis_type, source, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -181,6 +210,29 @@ def upsert_balances(con, balances: Iterable[Balance]) -> int:
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (account_id) DO UPDATE SET
             balance     = excluded.balance,
+            as_of       = excluded.as_of,
+            source      = excluded.source,
+            imported_at = excluded.imported_at
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def add_balances(con, balances: Iterable[Balance]) -> int:
+    """Add to each account's balance (create it if absent) — additive counterpart
+    to `upsert_balances`, so a manual CASH entry adds cash instead of replacing it.
+    """
+    now = datetime.now()
+    rows = [(b.account_id, float(b.balance), now, b.source, now) for b in balances]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        INSERT INTO balances (account_id, balance, as_of, source, imported_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (account_id) DO UPDATE SET
+            balance     = balances.balance + excluded.balance,
             as_of       = excluded.as_of,
             source      = excluded.source,
             imported_at = excluded.imported_at
@@ -221,7 +273,7 @@ def load_accounts_df(con) -> pd.DataFrame:
 def load_holdings_df(con) -> pd.DataFrame:
     return con.execute(
         "SELECT lot_id, account_id, symbol, quantity, cost_per_share, purchase_date, "
-        "source, imported_at FROM holdings ORDER BY account_id, symbol, purchase_date"
+        "cost_basis_type, source, imported_at FROM holdings ORDER BY account_id, symbol, purchase_date"
     ).df()
 
 
@@ -241,6 +293,47 @@ def load_prices_map(con) -> Dict[str, float]:
 def prices_as_of(con):
     row = con.execute("SELECT max(as_of) FROM prices").fetchone()
     return row[0] if row else None
+
+
+def rename_account(con, old_account_id: str, institution: str, name: str, account_type: str) -> str:
+    """Rename an account, updating the slug and all FK references.
+
+    Returns the new account_id.
+    """
+    from app.models import make_account_id
+    new_id = make_account_id(institution, name)
+    now = datetime.now()
+    if new_id != old_account_id:
+        con.execute(
+            "UPDATE holdings SET account_id = ? WHERE account_id = ?", [new_id, old_account_id]
+        )
+        con.execute(
+            "UPDATE balances SET account_id = ? WHERE account_id = ?", [new_id, old_account_id]
+        )
+    con.execute(
+        """
+        INSERT INTO accounts (account_id, institution, name, type, currency, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'USD', ?, ?)
+        ON CONFLICT (account_id) DO UPDATE SET
+            institution = excluded.institution,
+            name        = excluded.name,
+            type        = excluded.type,
+            updated_at  = excluded.updated_at
+        """,
+        [new_id, institution, name, account_type, now, now],
+    )
+    if new_id != old_account_id:
+        con.execute("DELETE FROM accounts WHERE account_id = ?", [old_account_id])
+    return new_id
+
+
+def delete_holdings(con, lot_ids: Iterable[int]) -> int:
+    ids = list(lot_ids)
+    if not ids:
+        return 0
+    placeholders = ",".join(["?"] * len(ids))
+    con.execute(f"DELETE FROM holdings WHERE lot_id IN ({placeholders})", ids)
+    return len(ids)
 
 
 # ---------------------------------------------------------------- admin

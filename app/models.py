@@ -62,6 +62,8 @@ class Account:
         return self.type in LIABILITY_TYPES
 
 
+COST_BASIS_TYPES = ("lot", "blended")
+
 @dataclass
 class Holding:
     account_id: str
@@ -70,6 +72,7 @@ class Holding:
     cost_per_share: float
     purchase_date: Optional[str] = None  # ISO 'YYYY-MM-DD' or None
     source: str = "csv"
+    cost_basis_type: str = "lot"  # "lot" = individual purchase; "blended" = averaged position
 
     def __post_init__(self) -> None:
         self.symbol = (self.symbol or "").strip().upper()

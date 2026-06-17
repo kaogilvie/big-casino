@@ -1,0 +1,21 @@
+goal,account_type,symbol,shares,cost_basis
+Safety Net,taxable,VTI,1.8234,356.12
+Safety Net,taxable,VXUS,3.4567,178.44
+Safety Net,taxable,LQD,6.2345,638.21
+Safety Net,taxable,BNDX,8.1234,412.56
+Safety Net,taxable,CASH,412.83,
+Roth IRA,roth_ira,VTI,38.4521,6823.45
+Roth IRA,roth_ira,VXUS,52.3412,2834.67
+Roth IRA,roth_ira,VTV,18.2341,2456.78
+Roth IRA,roth_ira,VOE,14.5678,1823.45
+Roth IRA,roth_ira,VBR,12.3456,1456.23
+Roth IRA,roth_ira,LQD,22.4567,2234.56
+Roth IRA,roth_ira,BNDX,18.6789,934.12
+Roth IRA,roth_ira,TIP,10.2345,1123.45
+Roth IRA,roth_ira,CASH,134.22,
+General Investing,taxable,VTI,8.3456,1523.45
+General Investing,taxable,VXUS,12.4567,634.23
+General Investing,taxable,VTV,6.7891,834.56
+General Investing,taxable,LQD,10.2345,1034.67
+General Investing,taxable,BNDX,8.9012,456.34
+General Investing,taxable,CASH,234.56,

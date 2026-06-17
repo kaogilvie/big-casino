@@ -22,3 +22,8 @@ __pycache__/
 
 # historical data
 data/historical/
+
+*.txt
+
+#playwright
+.playwright-mcp/

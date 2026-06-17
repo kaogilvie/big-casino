@@ -122,6 +122,7 @@ class EtradeCSVSource(PortfolioSource):
                     quantity=quantity,
                     cost_per_share=cost_per_share,
                     source=self.name,
+                    cost_basis_type="blended",
                 )
             )
 

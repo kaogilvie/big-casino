@@ -20,9 +20,12 @@ from app import db
 from app.analytics import balances_with_accounts, enrich
 from app.models import ACCOUNT_TYPES
 from app.prices import fetch_prices
+from app.sources.betterment_csv import BettermentCSVSource
+from app.sources.betterment_pdf import BettermentStatementPDFSource
 from app.sources.etrade_csv import EtradeCSVSource
 from app.sources.normalized_csv import NormalizedCSVSource, parse_normalized_df
 from app.theme import apply_theme
+from app.views import accounts as accounts_view
 from app.views import holdings as holdings_view
 from app.views import overview as overview_view
 
@@ -67,6 +70,15 @@ def do_import(con, source) -> str:
     return persist(con, source.fetch())
 
 
+def persist_append(con, result) -> str:
+    """Additive save for manual entry: new lots are appended (never replacing an
+    account's existing lots) and cash is added to any existing balance."""
+    db.upsert_accounts(con, result.accounts)
+    db.append_holdings(con, result.holdings)
+    db.add_balances(con, result.balances)
+    return result.summary()
+
+
 # Empty grid for manual entry — typed columns so the editor renders proper inputs.
 _MANUAL_COLUMNS = {
     "broker": str,
@@ -83,38 +95,29 @@ def _empty_manual_df() -> pd.DataFrame:
     return pd.DataFrame({c: pd.Series(dtype=t) for c, t in _MANUAL_COLUMNS.items()})
 
 
-def _current_lots_df(con) -> pd.DataFrame:
-    """Existing lots in the editor's column shape, so the grid edits real data."""
-    holdings = db.load_holdings_df(con)
-    accounts = db.load_accounts_df(con)
-    if holdings.empty:
-        return _empty_manual_df()
-    m = holdings.merge(accounts, on="account_id", how="left")
-    dates = m["purchase_date"].astype(str).replace({"NaT": "", "None": "", "nan": ""})
-    return pd.DataFrame(
-        {
-            "broker": m["institution"],
-            "account": m["name"],
-            "type": m["type"],
-            "symbol": m["symbol"],
-            "quantity": m["quantity"],
-            "cost_per_share": m["cost_per_share"],
-            "purchase_date": dates,
-        }
-    )
+# Defaults pre-filled in the Robinhood entry grid so you don't retype them.
+_ROBINHOOD_DEFAULTS = {"broker": "Robinhood", "account": "Individual", "type": "brokerage"}
+
+
+def _robinhood_starter_df() -> pd.DataFrame:
+    """Blank grid seeded with one Robinhood/Individual row to type a lot into."""
+    df = _empty_manual_df()
+    df.loc[0] = {c: _ROBINHOOD_DEFAULTS.get(c, "") for c in _MANUAL_COLUMNS}
+    return df
 
 
 def manual_entry(con) -> None:
     st.markdown("---")
-    st.markdown("**Enter / edit holdings**")
+    st.markdown("**Enter holdings**")
     st.caption(
         "**One row per purchase (lot)** — enter each buy separately with its own "
-        "cost and date for exact returns. Existing rows are loaded for editing; add "
-        "rows with the ➕. Use `CASH` as the symbol for a cash balance. "
-        "Saving replaces the holdings of every account shown here."
+        "cost and date for exact returns. `Broker`/`account` default to "
+        "Robinhood/Individual (blank rows inherit them). Add rows with the ➕. Use "
+        "`CASH` as the symbol for a cash balance. Saving **appends** these rows to "
+        "your existing holdings — it never replaces what's already there."
     )
     edited = st.data_editor(
-        _current_lots_df(con),
+        _robinhood_starter_df(),
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
@@ -132,15 +135,21 @@ def manual_entry(con) -> None:
     )
 
     if st.button("Save entries", type="primary"):
-        try:
-            result = parse_normalized_df(edited)
-            if not (result.holdings or result.balances):
-                st.warning("Nothing to save — add at least one row with a symbol.")
-            else:
-                st.session_state["import_msg"] = f"Saved {persist(con, result)}."
-                st.rerun()
-        except Exception as exc:
-            st.error(f"Save failed: {exc}")
+        with st.spinner("Saving…"):
+            try:
+                edited = edited.copy()
+                for col, default in _ROBINHOOD_DEFAULTS.items():
+                    edited[col] = edited[col].replace("", pd.NA).fillna(default)
+                result = parse_normalized_df(edited)
+                if not (result.holdings or result.balances):
+                    st.warning("Nothing to save — add at least one row with a symbol.")
+                else:
+                    msg = f"Saved {persist_append(con, result)}."
+                    st.success(msg)
+                    st.session_state["import_msg"] = msg
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Save failed: {exc}")
 
 
 ETRADE_GUIDE = """
@@ -171,10 +180,10 @@ history, and that's your lot data.** Enter one row per buy for exact returns.
 1. Open a stock in Robinhood (**robinhood.com** or the app) and scroll to
    **History** — your orders for that stock. Each **Buy** you still hold is a lot.
 2. Note its **shares**, **fill price**, and **date**.
-3. With **Normalized template** selected, add **one row per buy** in the manual
-   grid below — `broker=robinhood`, `account=Individual`, `type=brokerage`,
-   `symbol`, `quantity=`shares of that buy, `cost_per_share=`fill price,
-   `purchase_date=`date. (Two buys of the same stock = two rows.)
+3. With **Robinhood template** selected, add **one row per buy** in the manual
+   grid below — `broker` and `account` are pre-filled (Robinhood / Individual);
+   just enter `symbol`, `quantity=`shares of that buy, `cost_per_share=`fill
+   price, `purchase_date=`date. (Two buys of the same stock = two rows.)
 4. For uninvested cash, add a `symbol=CASH` row with `quantity=` your cash.
 
 **Faster for many positions:** *Account → Menu → Reports and statements →
@@ -188,6 +197,38 @@ but enter individual buys here for exact per-lot returns.)
 """
 
 
+BETTERMENT_GUIDE = """
+**The easiest path is your monthly statement PDF** — it contains ending share
+counts for every ETF across all your goals, plus your Cash Reserve balance.
+No manual data entry needed.
+
+**How to download it**
+
+1. Sign in at **betterment.com**.
+2. Go to **Documents** (top-right menu or account settings).
+3. Under **Statements**, find your most recent **Monthly Statement** and download
+   the PDF.
+4. Upload it here with **Betterment statement (PDF)** selected.
+
+**What gets imported**
+
+| source | what it becomes |
+|---|---|
+| Each investing goal (Safety Net, Retirement goal, etc.) | an Account + its ETF holdings |
+| Roth IRA / Traditional IRA | an Account (type = retirement) + holdings |
+| Cash Reserve ending balance | a Balance on a "bank" account |
+
+⚠️ The monthly statement does not include cost basis, so unrealized return will
+show as the full market value until you add cost basis separately. Use
+**Betterment CSV** if you want to enter cost basis manually.
+
+**Re-importing**
+
+Drop in the latest monthly statement any time — the import replaces all prior
+Betterment positions with the new end-of-month snapshot.
+"""
+
+
 def import_tab(con) -> None:
     st.subheader("Import holdings")
 
@@ -197,23 +238,51 @@ def import_tab(con) -> None:
     if msg:
         st.success(msg)
 
-    # Tutorials live at the top, collapsed by default.
-    st.markdown("**How to export your data**")
-    with st.expander("E\\*TRADE — download a portfolio CSV", expanded=False):
-        st.markdown(ETRADE_GUIDE)
-    with st.expander("Robinhood — get your holdings in", expanded=False):
-        st.markdown(ROBINHOOD_GUIDE)
-
-    st.markdown("---")
-
     source_type = st.radio(
         "File type",
-        ["Normalized template", "E*TRADE export"],
-        help="Robinhood: use the normalized template. E*TRADE: upload its native export.",
+        ["Robinhood template", "E*TRADE export", "Betterment statement (PDF)", "Betterment CSV"],
+        help="Robinhood: enter lots in the grid (or upload a template CSV). "
+        "E*TRADE: upload its native export. Betterment: upload the monthly statement PDF "
+        "(recommended) or a manually-built CSV.",
         horizontal=True,
     )
 
+    if source_type == "Betterment statement (PDF)":
+        with st.expander("Betterment — get your monthly statement", expanded=False):
+            st.markdown(BETTERMENT_GUIDE)
+        uploaded = st.file_uploader("Upload Betterment monthly statement", type=["pdf"])
+        if uploaded is not None and st.button("Import file"):
+            try:
+                summary = do_import(con, BettermentStatementPDFSource(uploaded))
+                st.session_state["import_msg"] = f"Imported {summary}."
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+        return
+
+    if source_type == "Betterment CSV":
+        with st.expander("Betterment — build your holdings CSV", expanded=False):
+            st.markdown(BETTERMENT_GUIDE)
+        with open(os.path.join(_PROJECT_ROOT, "samples", "betterment_sample.csv"), "rb") as fh:
+            st.download_button(
+                "Download sample CSV",
+                fh.read(),
+                file_name="betterment_sample.csv",
+                mime="text/csv",
+            )
+        uploaded = st.file_uploader("Upload Betterment CSV", type=["csv"])
+        if uploaded is not None and st.button("Import file"):
+            try:
+                summary = do_import(con, BettermentCSVSource(uploaded))
+                st.session_state["import_msg"] = f"Imported {summary}."
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+        return
+
     if source_type == "E*TRADE export":
+        with st.expander("E\\*TRADE — download a portfolio CSV", expanded=False):
+            st.markdown(ETRADE_GUIDE)
         account_name = st.text_input(
             "Account name",
             value="Individual",
@@ -229,7 +298,9 @@ def import_tab(con) -> None:
                 st.error(f"Import failed: {exc}")
         return
 
-    # Normalized template: CSV upload OR manual entry below.
+    # Robinhood template: CSV upload OR manual entry below.
+    with st.expander("Robinhood — get your holdings in", expanded=False):
+        st.markdown(ROBINHOOD_GUIDE)
     uploaded = st.file_uploader("Upload CSV", type=["csv"])
     if uploaded is not None and st.button("Import file"):
         try:
@@ -282,16 +353,6 @@ def main() -> None:
     holdings_df = db.load_holdings_df(con)
     balances_df = db.load_balances_df(con)
 
-    # Institution filter (drawn from accounts that actually have data).
-    if not accounts_df.empty:
-        institutions = sorted(accounts_df["institution"].dropna().unique())
-        chosen = st.sidebar.multiselect("Filter institutions", institutions, default=institutions)
-        keep_ids = set(accounts_df[accounts_df["institution"].isin(chosen)]["account_id"])
-        if not holdings_df.empty:
-            holdings_df = holdings_df[holdings_df["account_id"].isin(keep_ids)]
-        if not balances_df.empty:
-            balances_df = balances_df[balances_df["account_id"].isin(keep_ids)]
-
     prices = ensure_prices(con, holdings_df["symbol"].unique()) if not holdings_df.empty else {}
     enriched = enrich(holdings_df, accounts_df, prices)
     balances_view = balances_with_accounts(balances_df, accounts_df)
@@ -300,11 +361,13 @@ def main() -> None:
     if as_of is not None:
         st.caption(f"Prices as of {as_of:%Y-%m-%d %H:%M}. Use *Refresh prices* to update.")
 
-    tab_overview, tab_holdings, tab_import = st.tabs(["Overview", "Holdings", "Import"])
+    tab_overview, tab_holdings, tab_accounts, tab_import = st.tabs(["Overview", "Holdings", "Accounts", "Import"])
     with tab_overview:
         overview_view.render(enriched, balances_view)
     with tab_holdings:
-        holdings_view.render(enriched)
+        holdings_view.render(enriched, con)
+    with tab_accounts:
+        accounts_view.render(enriched, balances_view, con)
     with tab_import:
         import_tab(con)
 

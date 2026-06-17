@@ -52,8 +52,8 @@ Use the **Import tab**. Two file types are supported:
 ### 1. Normalized template (use this for Robinhood)
 Robinhood has no clean holdings export, so enter holdings yourself. Two ways:
 
-- **In-app editor (no file needed):** the Import tab has an *"Or enter rows
-  manually"* grid — type rows one at a time or paste several, then **Save
+- **In-app editor (no file needed):** the Import tab has an *"Enter holdings"*
+  grid (starts blank) — type rows one at a time or paste several, then **Save
   entries**. Use `CASH` as the symbol for a cash balance.
 - **CSV:** **Download blank template** in the Import tab (or copy
   [`data/templates/normalized_holdings_template.csv`](data/templates/normalized_holdings_template.csv)),
@@ -89,8 +89,11 @@ Holdings are stored as **lots** (one row per purchase), so multiple buys of the
 same stock keep their exact cost and date — total and per-lot return are precise.
 An import or manual save is **authoritative for the accounts it touches**: it
 replaces those accounts' lots (idempotent re-import, no duplicates) and leaves
-other accounts alone. The manual grid preloads existing lots so adding one doesn't
-wipe the rest. **Clear data** wipes the store; **Refresh prices** drops the cache.
+other accounts alone. The manual grid is the exception: it starts blank and
+**appends** — saving adds the lots you type to your existing holdings (and adds a
+`CASH` row to the account's balance) without replacing anything, so you don't
+re-enter prior rows. **Clear data** wipes the store; **Refresh prices** drops the
+cache.
 
 > Note: the E*TRADE portfolio export carries only *average* cost (one row per
 > symbol), so per-lot detail there is limited to that blended figure. Use E*TRADE's
