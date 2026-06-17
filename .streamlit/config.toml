@@ -1,0 +1,15 @@
+# Brand theme (amber / black / white). Logo intentionally not used —
+# this app holds personal financials and is not an &KO product.
+[theme]
+base = "dark"
+primaryColor = "#FCA917"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#0E0E0E"
+textColor = "#FFFFFF"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

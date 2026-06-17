@@ -1,0 +1,20 @@
+Account Summary
+Account,Total Assets,Total Unrealized Gain $,Total Unrealized Gain %,Day's Gain Unrealized $,Day's Gain Unrealized %
+"All brokerage accounts",9182.95,2181.95,31.18,12.40,0.15
+
+
+View Summary - All Positions
+Filters applied:
+Symbol,Security type(s),Sort by,Sort order,
+,All,Symbol,Asc,
+
+Symbol,Last Price $,Change $,Change %,Quantity,Price Paid $,Day's Gain $,Total Gain $,Total Gain %,Value $
+AAPL,195.32,1.20,0.62,10.0000,120.00,12.00,753.20,62.77,1953.20
+MSFT,420.55,-2.10,-0.50,5.0000,250.00,-10.50,852.75,68.22,2102.75
+NVDA,128.40,3.40,2.72,15.0000,90.00,51.00,576.00,42.67,1926.00
+CASH,,,,,,,,,3200.00,
+TOTAL,,,,,2009.17,12.40,2181.95,31.18,9182.95,
+
+
+
+Generated at Jun 16 2026 08:14 PM ET

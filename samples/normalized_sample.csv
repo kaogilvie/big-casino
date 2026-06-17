@@ -1,0 +1,5 @@
+broker,account,symbol,quantity,cost_per_share,purchase_date
+robinhood,Individual,TSLA,8,210.50,2023-03-20
+robinhood,Individual,VOO,3,360.00,2022-07-01
+robinhood,Individual,AMZN,12,140.25,2023-09-12
+robinhood,Individual,CASH,2200,1.00,

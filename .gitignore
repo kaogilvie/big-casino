@@ -1,0 +1,24 @@
+# Local data store (personal financials — never commit)
+data/*.duckdb
+data/*.duckdb.wal
+*.duckdb
+
+# Real broker exports / personal CSVs (keep only the synthetic samples/)
+imports/
+*.private.csv
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# historical data
+data/historical/

@@ -1,0 +1,3 @@
+broker,account,type,symbol,quantity,cost_per_share,purchase_date
+robinhood,Individual,brokerage,AAPL,10,120.00,2022-01-15
+robinhood,Individual,brokerage,CASH,1500,1.00,
