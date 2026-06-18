@@ -22,14 +22,18 @@ from app.models import ACCOUNT_TYPES
 from app.prices import fetch_prices
 from app.sources.betterment_csv import BettermentCSVSource
 from app.sources.betterment_pdf import BettermentStatementPDFSource
+from app.sources.chase_cc_pdf import ChaseCCPDFSource
 from app.sources.etrade_csv import EtradeCSVSource
 from app.sources.normalized_csv import NormalizedCSVSource, parse_normalized_df
+from app.sources.plaid import PlaidItemSource, exchange_public_token, remove_item
+from app import plaid_client as plaid_cfg
 from app.theme import apply_theme
 from app.views import accounts as accounts_view
+from app.views import cards as cards_view
 from app.views import holdings as holdings_view
 from app.views import overview as overview_view
 
-st.set_page_config(page_title="Portfolio", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Big Casino", page_icon="🎰", layout="wide")
 apply_theme(st)
 
 
@@ -63,6 +67,8 @@ def persist(con, result) -> str:
     account_ids = {a.account_id for a in result.accounts} | {h.account_id for h in result.holdings}
     db.replace_holdings(con, account_ids, result.holdings)
     db.upsert_balances(con, result.balances)
+    if getattr(result, "cards", None):
+        db.upsert_card_details(con, result.cards)
     return result.summary()
 
 
@@ -229,6 +235,95 @@ Betterment positions with the new end-of-month snapshot.
 """
 
 
+_PLAID_RESULT_FILE = os.path.join(_PROJECT_ROOT, "data", "plaid_result.json")
+_PLAID_SERVER_URL = "http://localhost:3001"
+
+
+def _consume_plaid_result(con) -> bool:
+    """Read plaid_result.json written by the Express server, import it, delete it.
+
+    Returns True if a result was consumed.
+    """
+    if not os.path.exists(_PLAID_RESULT_FILE):
+        return False
+    import json
+    try:
+        with open(_PLAID_RESULT_FILE) as f:
+            data = json.load(f)
+        os.remove(_PLAID_RESULT_FILE)
+        item_id = data["item_id"]
+        access_token = data["access_token"]
+        institution = data.get("institution", "Unknown")
+        db.upsert_plaid_item(con, item_id, access_token, institution)
+        client = plaid_cfg.get_client()
+        result = PlaidItemSource(client, access_token, institution).fetch()
+        persist(con, result)
+        st.success(f"Connected {institution} — imported {result.summary()}.")
+        return True
+    except Exception as exc:
+        st.error(f"Plaid import failed: {exc}")
+        return False
+
+
+def _plaid_section(con) -> None:
+    st.markdown("**Connected accounts (Plaid)**")
+
+    # ── Consume result written by the Express server ──────────────────
+    if _consume_plaid_result(con):
+        st.rerun()
+
+    # ── Show connected items ──────────────────────────────────────────
+    items_df = db.load_plaid_items(con)
+    if not items_df.empty:
+        for _, row in items_df.iterrows():
+            c1, c2, c3, c4 = st.columns([4, 2, 2, 2])
+            c1.markdown(f"**{row['institution']}**")
+            c2.caption(f"Connected {str(row['created_at'])[:10]}")
+            with c3:
+                if st.button("Refresh", key=f"plaid_refresh_{row['item_id']}",
+                             use_container_width=True):
+                    try:
+                        client = plaid_cfg.get_client()
+                        token = db.get_plaid_access_token(con, row["item_id"])
+                        result = PlaidItemSource(client, token, row["institution"]).fetch()
+                        persist(con, result)
+                        st.success(f"Refreshed {row['institution']} — {result.summary()}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Refresh failed: {exc}")
+            with c4:
+                if st.button("Delete", key=f"plaid_delete_{row['item_id']}",
+                             use_container_width=True):
+                    # Best-effort: invalidate the token at Plaid (stops billing).
+                    try:
+                        client = plaid_cfg.get_client()
+                        token = db.get_plaid_access_token(con, row["item_id"])
+                        if token:
+                            remove_item(client, token)
+                    except Exception:
+                        pass  # creds may already be invalid — still purge locally
+                    db.delete_plaid_connection(con, row["item_id"], row["institution"])
+                    st.success(f"Removed {row['institution']} and its imported data.")
+                    st.rerun()
+    else:
+        st.caption("No accounts connected yet.")
+
+    # ── Connect new account ───────────────────────────────────────────
+    if not plaid_cfg.is_configured():
+        st.warning("Plaid not configured — add PLAID_CLIENT_ID and PLAID_SECRET to your .env file.")
+        return
+
+    st.markdown(
+        f"1. Open **[localhost:3001]({_PLAID_SERVER_URL})** in a new tab and connect your account.\n"
+        "2. Once you see '✓ Connected!', come back here and click **Finish connecting**."
+    )
+    if st.button("Finish connecting", key="plaid_finish", type="primary"):
+        if not _consume_plaid_result(con):
+            st.warning("No connection found yet — complete the Plaid flow in the other tab first.")
+        else:
+            st.rerun()
+
+
 def import_tab(con) -> None:
     st.subheader("Import holdings")
 
@@ -238,9 +333,12 @@ def import_tab(con) -> None:
     if msg:
         st.success(msg)
 
+    _plaid_section(con)
+    st.markdown("---")
+
     source_type = st.radio(
         "File type",
-        ["Robinhood template", "E*TRADE export", "Betterment statement (PDF)", "Betterment CSV"],
+        ["Robinhood template", "E*TRADE export", "Betterment statement (PDF)", "Betterment CSV", "Chase credit card (PDF)"],
         help="Robinhood: enter lots in the grid (or upload a template CSV). "
         "E*TRADE: upload its native export. Betterment: upload the monthly statement PDF "
         "(recommended) or a manually-built CSV.",
@@ -298,6 +396,31 @@ def import_tab(con) -> None:
                 st.error(f"Import failed: {exc}")
         return
 
+    if source_type == "Chase credit card (PDF)":
+        with st.expander("Chase — download your statement", expanded=False):
+            st.markdown(
+                "1. Sign in at **chase.com**.\n"
+                "2. Go to your credit card account → **Statements & documents**.\n"
+                "3. Download the most recent **PDF statement**.\n"
+                "4. Upload it here.\n\n"
+                "The parser reads your **New Balance** (current amount owed) and adds "
+                "it as a liability that is netted out of your net worth."
+            )
+        label = st.text_input(
+            "Account label (optional)",
+            placeholder="e.g. Chase Sapphire — leave blank to use last 4 digits",
+        )
+        uploaded = st.file_uploader("Upload Chase statement PDF", type=["pdf"])
+        if uploaded is not None and st.button("Import file"):
+            try:
+                source = ChaseCCPDFSource(uploaded, account_label=label.strip() or None)
+                summary = do_import(con, source)
+                st.session_state["import_msg"] = f"Imported {summary}."
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+        return
+
     # Robinhood template: CSV upload OR manual entry below.
     with st.expander("Robinhood — get your holdings in", expanded=False):
         st.markdown(ROBINHOOD_GUIDE)
@@ -342,10 +465,10 @@ def main() -> None:
     con = get_connection()
 
     st.markdown(
-        "<h1>Portfolio <span class='ko-accent'>·</span> 360°</h1>",
+        "<h1>Big Casino <span style='font-size:0.5em;font-weight:400;color:#888;'>by &amp;KO</span></h1>",
         unsafe_allow_html=True,
     )
-    st.caption("Local-only view of your investments. Phase 1: E*TRADE + Robinhood.")
+    st.caption("Your personal finance dashboard, local and private.")
 
     sidebar(con)
 
@@ -356,18 +479,23 @@ def main() -> None:
     prices = ensure_prices(con, holdings_df["symbol"].unique()) if not holdings_df.empty else {}
     enriched = enrich(holdings_df, accounts_df, prices)
     balances_view = balances_with_accounts(balances_df, accounts_df)
+    card_details_df = db.load_card_details_df(con)
 
     as_of = db.prices_as_of(con)
     if as_of is not None:
         st.caption(f"Prices as of {as_of:%Y-%m-%d %H:%M}. Use *Refresh prices* to update.")
 
-    tab_overview, tab_holdings, tab_accounts, tab_import = st.tabs(["Overview", "Holdings", "Accounts", "Import"])
+    tab_overview, tab_holdings, tab_accounts, tab_cards, tab_import = st.tabs(
+        ["Overview", "Holdings", "Accounts", "Credit Cards", "Import"]
+    )
     with tab_overview:
         overview_view.render(enriched, balances_view)
     with tab_holdings:
         holdings_view.render(enriched, con)
     with tab_accounts:
         accounts_view.render(enriched, balances_view, con)
+    with tab_cards:
+        cards_view.render(balances_view, card_details_df, con)
     with tab_import:
         import_tab(con)
 

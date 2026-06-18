@@ -27,3 +27,6 @@ data/historical/
 
 #playwright
 .playwright-mcp/
+
+# node
+node_modules

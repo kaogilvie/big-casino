@@ -90,10 +90,27 @@ class Balance:
 
 
 @dataclass
+class CardDetail:
+    """Credit-card statement detail for a credit_card account.
+
+    `statement_balance` is the amount to pay by `due_date` to avoid interest
+    (the last statement balance, assuming a grace period and no carried balance).
+    Dates are ISO 'YYYY-MM-DD' strings or None.
+    """
+    account_id: str
+    statement_balance: Optional[float] = None
+    statement_date: Optional[str] = None
+    due_date: Optional[str] = None
+    minimum_payment: Optional[float] = None
+    source: str = "plaid"
+
+
+@dataclass
 class ImportResult:
     accounts: List[Account] = field(default_factory=list)
     holdings: List[Holding] = field(default_factory=list)
     balances: List[Balance] = field(default_factory=list)
+    cards: List[CardDetail] = field(default_factory=list)
 
     def summary(self) -> str:
         return (

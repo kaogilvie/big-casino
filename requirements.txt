@@ -4,3 +4,5 @@ yfinance>=0.2.50
 pandas>=2.2
 plotly>=5.24
 pdfplumber>=0.11
+plaid-python>=20.0.0
+python-dotenv>=1.0

@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List
 import duckdb
 import pandas as pd
 
-from app.models import Account, Balance, Holding
+from app.models import Account, Balance, CardDetail, Holding
 from app.sources.base import parse_date
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +76,27 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+_PLAID_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plaid_items (
+    item_id      VARCHAR PRIMARY KEY,
+    access_token VARCHAR NOT NULL,
+    institution  VARCHAR,
+    created_at   TIMESTAMP
+);
+"""
+
+_CARD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS card_details (
+    account_id        VARCHAR PRIMARY KEY,
+    statement_balance DOUBLE,
+    statement_date    DATE,
+    due_date          DATE,
+    minimum_payment   DOUBLE,
+    source            VARCHAR,
+    imported_at       TIMESTAMP
+);
+"""
+
 _TABLES = ("accounts", "holdings", "balances", "prices", "meta")
 
 
@@ -102,6 +123,8 @@ def connect(db_path: str = DEFAULT_DB_PATH):
             con.execute(f"DROP TABLE IF EXISTS {t}")
         con.execute("DROP SEQUENCE IF EXISTS holdings_lot_seq")
     con.execute(_SCHEMA)
+    con.execute(_PLAID_SCHEMA)
+    con.execute(_CARD_SCHEMA)
     con.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -242,6 +265,47 @@ def add_balances(con, balances: Iterable[Balance]) -> int:
     return len(rows)
 
 
+def upsert_card_details(con, cards: Iterable[CardDetail]) -> int:
+    now = datetime.now()
+    rows = []
+    for c in cards:
+        rows.append((
+            c.account_id,
+            c.statement_balance,
+            parse_date(c.statement_date) if c.statement_date else None,
+            parse_date(c.due_date) if c.due_date else None,
+            c.minimum_payment,
+            c.source,
+            now,
+        ))
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        INSERT INTO card_details
+            (account_id, statement_balance, statement_date, due_date,
+             minimum_payment, source, imported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (account_id) DO UPDATE SET
+            statement_balance = excluded.statement_balance,
+            statement_date    = excluded.statement_date,
+            due_date          = excluded.due_date,
+            minimum_payment   = excluded.minimum_payment,
+            source            = excluded.source,
+            imported_at       = excluded.imported_at
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def load_card_details_df(con) -> pd.DataFrame:
+    return con.execute(
+        "SELECT account_id, statement_balance, statement_date, due_date, "
+        "minimum_payment FROM card_details ORDER BY account_id"
+    ).df()
+
+
 def upsert_prices(con, prices: Dict[str, float], source: str = "yfinance") -> int:
     now = datetime.now()
     rows = [(sym.upper(), float(p), now, source) for sym, p in prices.items()]
@@ -293,6 +357,72 @@ def load_prices_map(con) -> Dict[str, float]:
 def prices_as_of(con):
     row = con.execute("SELECT max(as_of) FROM prices").fetchone()
     return row[0] if row else None
+
+
+def upsert_plaid_item(con, item_id: str, access_token: str, institution: str) -> None:
+    now = datetime.now()
+    con.execute(
+        """
+        INSERT INTO plaid_items (item_id, access_token, institution, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (item_id) DO UPDATE SET
+            access_token = excluded.access_token,
+            institution  = excluded.institution
+        """,
+        [item_id, access_token, institution, now],
+    )
+
+
+def load_plaid_items(con) -> pd.DataFrame:
+    return con.execute(
+        "SELECT item_id, institution, created_at FROM plaid_items ORDER BY created_at"
+    ).df()
+
+
+def get_plaid_access_token(con, item_id: str) -> str | None:
+    row = con.execute(
+        "SELECT access_token FROM plaid_items WHERE item_id = ?", [item_id]
+    ).fetchone()
+    return row[0] if row else None
+
+
+def delete_plaid_item(con, item_id: str) -> None:
+    con.execute("DELETE FROM plaid_items WHERE item_id = ?", [item_id])
+
+
+def delete_plaid_connection(con, item_id: str, institution: str) -> None:
+    """Remove a Plaid connection: its stored creds plus the data it imported.
+
+    Holdings/balances tagged source='plaid' under this institution's accounts are
+    deleted, then any account left with no holdings and no balance is dropped.
+    Manually-entered data (other sources) and other institutions are untouched.
+    """
+    from app.models import make_account_id
+
+    # Accounts under this institution are slugged "<institution>__*".
+    prefix = make_account_id(institution, "x").rsplit("__", 1)[0] + "__"
+    like = prefix + "%"
+
+    con.execute(
+        "DELETE FROM holdings WHERE source = 'plaid' AND account_id LIKE ?", [like]
+    )
+    con.execute(
+        "DELETE FROM balances WHERE source = 'plaid' AND account_id LIKE ?", [like]
+    )
+    con.execute(
+        "DELETE FROM card_details WHERE account_id LIKE ?", [like]
+    )
+    # Drop now-empty accounts for this institution.
+    con.execute(
+        """
+        DELETE FROM accounts
+        WHERE account_id LIKE ?
+          AND account_id NOT IN (SELECT account_id FROM holdings)
+          AND account_id NOT IN (SELECT account_id FROM balances)
+        """,
+        [like],
+    )
+    con.execute("DELETE FROM plaid_items WHERE item_id = ?", [item_id])
 
 
 def rename_account(con, old_account_id: str, institution: str, name: str, account_type: str) -> str:

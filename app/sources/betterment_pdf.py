@@ -41,7 +41,7 @@ INSTITUTION = "Betterment"
 # Stable mapping of account numbers to canonical names + types.
 # Long account names in the PDF can wrap across lines, so we key by number.
 _ACCOUNT_NUMBER_MAP: dict[str, tuple[str, str]] = {
-    "8400124716956":   ("Retirement - Tax-Coordinated Portfolio", "brokerage"),
+    "8400124716956":   ("Retirement - Tax-Coordinated Portfolio", "retirement"),
     "8400139953610":   ("Safety Net - Automated Investing",       "brokerage"),
     "8400146880350":   ("Climate Investing - Automated Investing","brokerage"),
     "268011229047166": ("Roth IRA",                               "retirement"),
