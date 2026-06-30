@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { usePlaidLink } from "react-plaid-link";
-import { api, ACCOUNT_TYPES, type ManualRow, type PlaidItem } from "@/lib/api";
+import { api, ACCOUNT_TYPES, type ManagedAccount, type ManualRow, type PlaidItem } from "@/lib/api";
 import { Card, CardContent, CardTitle } from "@/components/ui/card";
+import { Collapsible } from "@/components/ui/collapsible";
 import { Button } from "@/components/ui/button";
+import { typeLabel } from "@/lib/utils";
 
 function Status({ msg, error }: { msg: string | null; error: boolean }) {
   if (!msg) return null;
@@ -32,6 +34,66 @@ function PlaidLauncher({ token, onDone }: { token: string; onDone: (msg: string,
   }, [ready, open]);
 
   return null;
+}
+
+function PlaidItemRow({
+  it,
+  onRefresh,
+  onRemove,
+  onAliasSaved,
+}: {
+  it: PlaidItem;
+  onRefresh: (id: string, label: string | null) => void;
+  onRemove: (id: string, label: string | null) => void;
+  onAliasSaved: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [alias, setAlias] = useState(it.alias ?? "");
+  const label = it.alias || it.institution;
+
+  const save = async () => {
+    await api.plaidSetAlias(it.item_id, alias.trim());
+    setEditing(false);
+    onAliasSaved();
+  };
+
+  return (
+    <div className="flex items-center gap-3 text-sm">
+      {editing ? (
+        <div className="flex items-center gap-2 flex-1">
+          <input
+            autoFocus
+            className="bg-transparent border border-brand-gray rounded px-2 py-1 text-sm w-56"
+            placeholder={it.institution ?? "Alias"}
+            value={alias}
+            onChange={(e) => setAlias(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && save()}
+          />
+          <Button size="sm" onClick={save}>
+            Save
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => { setAlias(it.alias ?? ""); setEditing(false); }}>
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <div className="flex items-baseline gap-2 flex-1">
+          <span className="font-medium">{label}</span>
+          {it.alias && <span className="text-muted-foreground text-xs">({it.institution})</span>}
+          <button className="text-muted-foreground hover:text-foreground text-xs" onClick={() => setEditing(true)}>
+            ✎ alias
+          </button>
+        </div>
+      )}
+      <span className="text-muted-foreground text-xs">Connected {it.created_at?.slice(0, 10)}</span>
+      <Button size="sm" variant="outline" onClick={() => onRefresh(it.item_id, label)}>
+        Refresh
+      </Button>
+      <Button size="sm" variant="destructive" onClick={() => onRemove(it.item_id, label)}>
+        Delete
+      </Button>
+    </div>
+  );
 }
 
 function PlaidSection({ onChanged }: { onChanged: () => void }) {
@@ -100,18 +162,13 @@ function PlaidSection({ onChanged }: { onChanged: () => void }) {
         ) : (
           <div className="space-y-2">
             {items.map((it) => (
-              <div key={it.item_id} className="flex items-center gap-3 text-sm">
-                <span className="font-medium flex-1">{it.institution}</span>
-                <span className="text-muted-foreground text-xs">
-                  Connected {it.created_at?.slice(0, 10)}
-                </span>
-                <Button size="sm" variant="outline" onClick={() => refresh(it.item_id, it.institution)}>
-                  Refresh
-                </Button>
-                <Button size="sm" variant="destructive" onClick={() => remove(it.item_id, it.institution)}>
-                  Delete
-                </Button>
-              </div>
+              <PlaidItemRow
+                key={it.item_id}
+                it={it}
+                onRefresh={refresh}
+                onRemove={remove}
+                onAliasSaved={loadItems}
+              />
             ))}
           </div>
         )}
@@ -222,9 +279,7 @@ function ManualEntry({ onChanged }: { onChanged: () => void }) {
 
   const cell = "bg-transparent border border-brand-gray rounded px-2 py-1 text-xs";
   return (
-    <Card>
-      <CardContent className="pt-5 space-y-3">
-        <CardTitle className="text-sm">Enter holdings manually</CardTitle>
+      <div className="space-y-3">
         <p className="text-xs text-muted-foreground">
           One row per purchase (lot) for exact returns. Use <code>CASH</code> as the symbol for a cash
           balance. Saving appends to existing holdings.
@@ -248,7 +303,7 @@ function ManualEntry({ onChanged }: { onChanged: () => void }) {
                   <td className="px-1 py-1">
                     <select className={cell} value={r.type} onChange={(e) => update(i, "type", e.target.value)}>
                       {ACCOUNT_TYPES.map((t) => (
-                        <option key={t} value={t} className="bg-brand-panel">{t}</option>
+                        <option key={t} value={t} className="bg-brand-panel">{typeLabel(t)}</option>
                       ))}
                     </select>
                   </td>
@@ -277,24 +332,138 @@ function ManualEntry({ onChanged }: { onChanged: () => void }) {
           </Button>
           <Status msg={msg} error={error} />
         </div>
+      </div>
+  );
+}
+
+function AccountRow({ a, onChanged }: { a: ManagedAccount; onChanged: () => void }) {
+  const [institution, setInstitution] = useState(a.institution);
+  const [name, setName] = useState(a.name);
+  const [type, setType] = useState(a.type);
+  const [category, setCategory] = useState(a.category);
+  const [excluded, setExcluded] = useState(a.excluded);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const dirty =
+    institution !== a.institution ||
+    name !== a.name ||
+    type !== a.type ||
+    category !== a.category ||
+    excluded !== a.excluded;
+
+  const save = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      if (category !== a.category || excluded !== a.excluded) {
+        await api.updateAccountSettings(a.account_id, { category, excluded });
+      }
+      if (institution !== a.institution || name !== a.name || type !== a.type) {
+        await api.renameAccount(a.account_id, { institution, name, type });
+      }
+      onChanged();
+    } catch (e: any) {
+      setErr(e.message);
+      setBusy(false);
+    }
+  };
+
+  const input = "bg-transparent border border-brand-gray rounded px-2 py-1 text-xs";
+  return (
+    <tr className={`border-b border-brand-gray/40 ${excluded ? "opacity-50" : ""}`}>
+      <td className="px-2 py-1.5"><input className={`${input} w-28`} value={institution} onChange={(e) => setInstitution(e.target.value)} /></td>
+      <td className="px-2 py-1.5"><input className={`${input} w-48`} value={name} onChange={(e) => setName(e.target.value)} /></td>
+      <td className="px-2 py-1.5">
+        <select className={input} value={type} onChange={(e) => setType(e.target.value)}>
+          {ACCOUNT_TYPES.map((t) => <option key={t} value={t} className="bg-brand-panel">{typeLabel(t)}</option>)}
+        </select>
+      </td>
+      <td className="px-2 py-1.5">
+        <div className="inline-flex rounded border border-brand-gray overflow-hidden text-xs">
+          <button
+            className={category === "personal" ? "bg-primary text-primary-foreground px-2 py-1" : "px-2 py-1"}
+            onClick={() => setCategory("personal")}
+          >
+            Personal
+          </button>
+          <button
+            className={category === "ko" ? "bg-primary text-primary-foreground px-2 py-1" : "px-2 py-1"}
+            onClick={() => setCategory("ko")}
+          >
+            &amp;KO
+          </button>
+        </div>
+      </td>
+      <td className="px-2 py-1.5 text-center">
+        <input type="checkbox" checked={excluded} onChange={(e) => setExcluded(e.target.checked)} />
+      </td>
+      <td className="px-2 py-1.5">
+        {dirty && (
+          <Button size="sm" onClick={save} disabled={busy}>
+            Save
+          </Button>
+        )}
+        {err && <div className="text-brand-red text-xs">{err}</div>}
+      </td>
+    </tr>
+  );
+}
+
+function ManageAccounts({ onChanged }: { onChanged: () => void }) {
+  const [accounts, setAccounts] = useState<ManagedAccount[]>([]);
+  const load = () => api.listAccounts().then((r) => setAccounts(r.accounts));
+  useEffect(() => {
+    load();
+  }, []);
+
+  const changed = () => {
+    load();
+    onChanged();
+  };
+
+  return (
+    <Card>
+      <CardContent className="pt-5">
+        <CardTitle className="text-sm mb-1">Manage accounts</CardTitle>
+        <p className="text-xs text-muted-foreground mb-3">
+          Rename, re-type, tag as Personal or &amp;KO, or exclude an account from all views (e.g. a
+          broken Plaid feed). Excluded accounts stay in the database and can be restored here.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="text-xs">
+            <thead className="text-muted-foreground">
+              <tr>
+                {["Institution", "Name", "Type", "Category", "Exclude", ""].map((h) => (
+                  <th key={h} className="px-2 py-1 text-left font-medium">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {accounts.map((a) => (
+                <AccountRow key={a.account_id} a={a} onChanged={changed} />
+              ))}
+            </tbody>
+          </table>
+        </div>
       </CardContent>
     </Card>
   );
 }
 
-export function Import({ onChanged }: { onChanged: () => void }) {
+export function Configuration({ onChanged }: { onChanged: () => void }) {
   return (
     <div className="space-y-6">
       <PlaidSection onChanged={onChanged} />
-      <Card>
-        <CardContent className="pt-5">
-          <CardTitle className="text-sm mb-3">Upload a file</CardTitle>
-          {UPLOADS.map((u) => (
-            <UploadRow key={u.endpoint} u={u} onChanged={onChanged} />
-          ))}
-        </CardContent>
-      </Card>
-      <ManualEntry onChanged={onChanged} />
+      <ManageAccounts onChanged={onChanged} />
+      <Collapsible title="Upload a file">
+        {UPLOADS.map((u) => (
+          <UploadRow key={u.endpoint} u={u} onChanged={onChanged} />
+        ))}
+      </Collapsible>
+      <Collapsible title="Enter holdings manually">
+        <ManualEntry onChanged={onChanged} />
+      </Collapsible>
     </div>
   );
 }

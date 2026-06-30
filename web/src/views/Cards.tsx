@@ -3,6 +3,14 @@ import { Card, CardContent } from "@/components/ui/card";
 import { DataTable } from "@/components/DataTable";
 import { Metric } from "@/components/Metric";
 import { money } from "@/lib/utils";
+import { RefreshBar } from "@/components/RefreshBar";
+
+interface Props {
+  data: Portfolio;
+  onRefreshAccounts: () => void;
+  refreshingAccounts: boolean;
+  plaidLastRefresh: string | null;
+}
 
 function dueLabel(due: string | null): string {
   if (!due) return "—";
@@ -14,7 +22,7 @@ function dueLabel(due: string | null): string {
   return `${when} (${days}d)`;
 }
 
-export function Cards({ data }: { data: Portfolio }) {
+export function Cards({ data, onRefreshAccounts, refreshingAccounts, plaidLastRefresh }: Props) {
   const cards = data.cards;
   const totalOwed = cards.reduce((s, c) => s + (c.balance || 0), 0);
   const totalStatement = cards.reduce((s, c) => s + (c.statement_balance || 0), 0);
@@ -29,7 +37,14 @@ export function Cards({ data }: { data: Portfolio }) {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
+      <RefreshBar
+        label="Refresh accounts"
+        timestamp={plaidLastRefresh}
+        onClick={onRefreshAccounts}
+        loading={refreshingAccounts}
+        loadingLabel="Refreshing…"
+      />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         <Metric label="Current balance (owed)" value={money(totalOwed)} />
         <Metric label="Statement balance (to avoid interest)" value={money(totalStatement)} />

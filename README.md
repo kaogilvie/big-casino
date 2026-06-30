@@ -1,133 +1,137 @@
-# Portfolio · 360°
+# Big Casino (by &KO)
 
-A **local-only** dashboard for a single view of your investments. Phase 1 pulls
-**E\*TRADE** and **Robinhood** stock holdings from CSV into one place and shows
-quantity, cost basis, live price, and unrealized return.
+A **local-only** 360° personal finance dashboard — investments, cash, credit cards, and net worth in one place. Live bank/brokerage data via Plaid; CSV imports for brokers Plaid doesn't cover well.
 
-> Personal financials. Runs entirely on your machine — nothing is sent anywhere
-> except the (read-only) price lookups to Yahoo Finance. The DuckDB data file is
-> gitignored and never committed. Uses the &KO brand colors but not the logo;
-> this is not an &KO product.
+> Runs entirely on your machine. Nothing is sent anywhere except read-only price lookups to Yahoo Finance. The DuckDB data file is gitignored and never committed.
 
 ## Stack
-- **Streamlit** UI (brand-themed: amber `#FCA917` on black)
-- **DuckDB** local file store (`data/portfolio.duckdb`) — the source of truth
-- **yfinance** for live prices (persisted in the `prices` table, refresh on demand)
-- Pluggable **source adapters** so APIs / Plaid can be added later without
-  touching the dashboard
 
-## Data model
-
-Four tables, each a distinct entity (see [app/db.py](app/db.py)):
-
-| table | what it holds | key |
-|---|---|---|
-| `accounts` | account metadata: institution, name, type (`brokerage`/`bank`/`credit_card`/`retirement`), currency | `account_id` (slug, e.g. `robinhood__individual`) |
-| `holdings` | purchase **lots** — one row per buy (multiple lots per symbol allowed), each with its own cost & date | `lot_id` |
-| `balances` | cash / bank / card balance per account | `account_id` |
-| `prices` | latest quote per symbol, with `as_of` | `symbol` |
-
-Holdings and balances reference an account by `account_id`. **Prices are decoupled
-from holdings** — a price refresh never rewrites a position. Market value and
-return are computed at read time ([app/analytics.py](app/analytics.py)), never
-stored. Cash is *not* a holding: a `CASH` row in a CSV becomes a `balances` row.
-Liability accounts (credit cards) subtract from net worth.
+| layer | tech |
+|---|---|
+| Frontend | React + Vite + TypeScript + Tailwind v3 + shadcn-style components |
+| Backend | FastAPI (Python), wrapping the core `app/` library as a JSON API |
+| Store | DuckDB local file (`data/portfolio.duckdb`) |
+| Prices | yfinance (cached in `prices` table, refresh on demand) |
+| Bank/brokerage data | Plaid (Link via `react-plaid-link`) |
 
 ## Setup
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+cd web && npm install
 ```
 
+Copy `.env.example` to `.env` and fill in your Plaid credentials (optional — the app runs without them, Plaid features just won't appear).
+
 ## Run
+
 ```bash
-.venv/bin/streamlit run app/main.py
+cd web && npm run dev
 ```
-Then open the URL it prints (default http://localhost:8501).
+
+This starts both servers via `concurrently`:
+- FastAPI/uvicorn on `http://localhost:8000`
+- Vite dev server on `http://localhost:5173` (proxies `/api` to 8000)
+
+Open **http://localhost:5173**.
+
+## Data model
+
+| table | what it holds | key |
+|---|---|---|
+| `accounts` | institution, name, type, Plaid item link | `account_id` (slug, e.g. `chase_personal__checking`) |
+| `account_settings` | per-account exclude flag and personal/&KO category | `account_id` |
+| `holdings` | purchase lots — one row per buy | `lot_id` |
+| `balances` | cash / bank balance per account | `account_id` |
+| `card_details` | statement balance, due date, minimum payment | `account_id` |
+| `prices` | latest quote per symbol | `symbol` |
+| `plaid_items` | Plaid access tokens + optional display alias | `item_id` |
+
+Market value and return are computed at read time (`app/analytics.py`), never stored. Liability accounts subtract from net worth.
+
+## Features
+
+**Overview** — net worth summary, allocation pie, institution bar chart (liabilities in red), and account balances table.
+
+**Holdings** — all investment lots with live price, cost basis, and unrealized return.
+
+**Accounts** — read-only view of account balances.
+
+**Credit Cards** — current balance, statement balance, due date, minimum payment.
+
+**Configuration** — everything that changes your data:
+- **Plaid connections** — connect, refresh, delete, and alias each bank/brokerage connection. Connecting the same bank twice auto-disambiguates the namespace (e.g. "Chase" vs "Chase (2)") so accounts don't collide. Aliases let you rename connections to something meaningful (e.g. "Chase Personal" / "Chase Business").
+- **Manage accounts** — rename, retype, set personal vs &KO category, or exclude any account (e.g. unsupported crypto accounts).
+- **File imports** — E\*TRADE CSV, Betterment CSV, normalized CSV template.
+- **Manual entry** — enter lots directly without a file.
+
+**All / Personal / &KO filter** — global header toggle filters every view to a single ownership context.
+
+## Project layout
+
+```
+app/                   Core Python library (no UI code)
+  db.py                DuckDB schema + all read/write functions
+  models.py            Account / Holding / Balance / ImportResult
+  analytics.py         enrich() + totals(): market value, return, net worth
+  prices.py            yfinance batch quotes
+  plaid_client.py      Plaid SDK setup (reads .env)
+  sources/             Pluggable import adapters
+    plaid.py           PlaidItemSource — fetches accounts, holdings, balances, liabilities
+    betterment_csv.py
+    etrade_csv.py
+    normalized_csv.py
+api/                   FastAPI app
+  main.py              App factory, CORS, router registration
+  services.py          Shared DuckDB connection + threading lock
+  routers/
+    portfolio.py       GET /api/portfolio (summary, holdings, balances, cards)
+    accounts.py        GET/PATCH /api/accounts (rename, settings)
+    plaid.py           Plaid link-token / exchange / refresh / delete
+    import_.py         File + manual import endpoints
+    prices.py          POST /api/refresh-prices
+web/                   React frontend
+  src/
+    App.tsx            Shell: tabs, global filter, retirement toggle
+    views/             Overview, Holdings, Accounts, CreditCards, Import (Configuration)
+    lib/
+      api.ts           Typed fetch client for the FastAPI backend
+      utils.ts         money(), typeLabel(), cn()
+    components/ui/     Button, Table, Badge, Collapsible, etc.
+data/                  portfolio.duckdb (gitignored) + CSV templates
+samples/               Synthetic CSVs for testing
+tests/                 Offline pipeline tests (no network)
+```
 
 ## Importing holdings
 
-Use the **Import tab**. Two file types are supported:
+### Plaid (recommended)
+Connect via **Configuration → Plaid connections**. Supported: most US banks, brokerages, and credit cards. Refresh any time to pull the latest data.
 
-### 1. Normalized template (use this for Robinhood)
-Robinhood has no clean holdings export, so enter holdings yourself. Two ways:
+### E\*TRADE CSV
+**Portfolios → Download** on E\*TRADE, then upload via Configuration → E\*TRADE export.
 
-- **In-app editor (no file needed):** the Import tab has an *"Enter holdings"*
-  grid (starts blank) — type rows one at a time or paste several, then **Save
-  entries**. Use `CASH` as the symbol for a cash balance.
-- **CSV:** **Download blank template** in the Import tab (or copy
-  [`data/templates/normalized_holdings_template.csv`](data/templates/normalized_holdings_template.csv)),
-  fill it, and upload.
+### Betterment CSV
+Download from Betterment, upload via Configuration → Betterment export.
 
-Both paths use the same columns and parser:
+### Normalized CSV / manual entry
+Use the blank template or the in-app manual entry grid. Columns:
 
-| column | required | notes |
-|---|---|---|
-| `broker` | yes | institution, e.g. `robinhood`, `chase` |
-| `account` | yes | your nickname for the account, e.g. `Individual` |
-| `type` | optional | `brokerage` (default), `bank`, `credit_card`, `retirement` |
-| `symbol` | yes | ticker; use `CASH` for an uninvested cash balance (→ `balances`) |
-| `quantity` | yes | shares (or dollars, for a `CASH` row) |
-| `cost_per_share` | one of | average price paid per share |
-| `total_cost` | these two | alternative to `cost_per_share`; per-share is derived |
-| `purchase_date` | optional | `YYYY-MM-DD` |
-
-A pure cash/bank account is just one `CASH` row with `type` set (e.g.
-`chase,Checking,bank,CASH,5000,1.00,`).
-
-### 2. E\*TRADE export
-On E\*TRADE: **Portfolios → Download** (CSV). Upload it with the **E\*TRADE
-export** file type selected. The parser finds the header row containing `Symbol`
-and `Qty`, reads the positions, and skips the cash/total/disclaimer rows.
-
-> The parser is written against the standard export format and is tolerant of
-> small variations. If your export uses different column names, drop a redacted
-> copy in `samples/` and the parser can be tightened to match.
-
-### Import behavior
-Holdings are stored as **lots** (one row per purchase), so multiple buys of the
-same stock keep their exact cost and date — total and per-lot return are precise.
-An import or manual save is **authoritative for the accounts it touches**: it
-replaces those accounts' lots (idempotent re-import, no duplicates) and leaves
-other accounts alone. The manual grid is the exception: it starts blank and
-**appends** — saving adds the lots you type to your existing holdings (and adds a
-`CASH` row to the account's balance) without replacing anything, so you don't
-re-enter prior rows. **Clear data** wipes the store; **Refresh prices** drops the
-cache.
-
-> Note: the E*TRADE portfolio export carries only *average* cost (one row per
-> symbol), so per-lot detail there is limited to that blended figure. Use E*TRADE's
-> tax-lot export or the manual grid for exact lots.
-
-## Project layout
-```
-app/
-  main.py            Streamlit entry (sidebar, import, tabs, price persistence)
-  models.py          Account / Holding / Balance + ImportResult; account_id slug
-  db.py              DuckDB: accounts/holdings/balances/prices + upsert/load
-  prices.py          yfinance batch quotes (+ per-ticker fallback)
-  analytics.py       enrich() + totals(): market value, return, cash, net worth
-  theme.py           brand palette, CSS, Plotly template
-  sources/           pluggable adapters (CSV now; API/Plaid later)
-    base.py          PortfolioSource ABC + parsing helpers
-    normalized_csv.py   routes CASH -> balances
-    etrade_csv.py       captures positions + CASH&ALT value as a balance
-  views/             overview (metrics + charts + cash), holdings (table)
-data/                portfolio.duckdb (gitignored) + blank template
-samples/             synthetic CSVs for testing
-tests/               offline pipeline tests (no network)
-```
+| column | notes |
+|---|---|
+| `broker` | institution name |
+| `account` | your nickname for the account |
+| `type` | `brokerage`, `bank`, `credit_card`, or `retirement` |
+| `symbol` | ticker; use `CASH` for uninvested cash (→ balances) |
+| `quantity` | shares (or dollars for `CASH`) |
+| `cost_per_share` | average price paid per share |
+| `purchase_date` | `YYYY-MM-DD` (optional) |
 
 ## Tests
+
 ```bash
 .venv/bin/python tests/test_pipeline.py
 ```
-Covers both CSV adapters, the enrich/totals math, and a DuckDB upsert round-trip.
-No network required (prices are stubbed).
 
-## Roadmap (next phases)
-- Bank & credit-card accounts (Capital One, Chase, Wells Fargo, Citi, Betterment, Fidelity)
-- **Tagging + "hold X"**: actual balance vs. effective balance without moving money
-- Historical value-over-time tracking
-- Live ingestion via broker APIs (E\*TRADE OAuth) or Plaid — slots in as new
-  `PortfolioSource` adapters; the store and UI stay the same.
+Covers CSV adapters, analytics math, and DuckDB upsert round-trips. No network required.

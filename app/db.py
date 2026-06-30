@@ -36,9 +36,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     name         VARCHAR NOT NULL,
     type         VARCHAR NOT NULL DEFAULT 'brokerage',
     currency     VARCHAR NOT NULL DEFAULT 'USD',
+    item_id      VARCHAR,          -- Plaid item this account came from (NULL for manual/file)
     created_at   TIMESTAMP,
     updated_at   TIMESTAMP
 );
+-- For DBs created before `item_id` existed.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS item_id VARCHAR;
 
 -- One row per purchase LOT (not per symbol), so exact cost basis and per-lot
 -- return are preserved. A position = the sum of its lots for (account_id, symbol).
@@ -81,8 +84,11 @@ CREATE TABLE IF NOT EXISTS plaid_items (
     item_id      VARCHAR PRIMARY KEY,
     access_token VARCHAR NOT NULL,
     institution  VARCHAR,
+    alias        VARCHAR,
     created_at   TIMESTAMP
 );
+-- For DBs created before `alias` existed (table isn't dropped on version bumps).
+ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS alias VARCHAR;
 """
 
 _CARD_SCHEMA = """
@@ -94,6 +100,16 @@ CREATE TABLE IF NOT EXISTS card_details (
     minimum_payment   DOUBLE,
     source            VARCHAR,
     imported_at       TIMESTAMP
+);
+"""
+
+# User preferences per account, decoupled from import-managed `accounts` so a
+# Plaid/file refresh never overwrites them. category: 'personal' | 'ko'.
+_ACCOUNT_SETTINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS account_settings (
+    account_id  VARCHAR PRIMARY KEY,
+    excluded    BOOLEAN NOT NULL DEFAULT FALSE,
+    category    VARCHAR NOT NULL DEFAULT 'personal'
 );
 """
 
@@ -125,11 +141,20 @@ def connect(db_path: str = DEFAULT_DB_PATH):
     con.execute(_SCHEMA)
     con.execute(_PLAID_SCHEMA)
     con.execute(_CARD_SCHEMA)
+    con.execute(_ACCOUNT_SETTINGS_SCHEMA)
     con.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         [str(SCHEMA_VERSION)],
     )
+    # One-time: link pre-existing Plaid accounts to their item (item_id was added later).
+    done = con.execute("SELECT value FROM meta WHERE key = 'item_backfill_v1'").fetchone()
+    if not done:
+        _backfill_item_links(con)
+        con.execute(
+            "INSERT INTO meta (key, value) VALUES ('item_backfill_v1', '1') "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+        )
     return con
 
 
@@ -306,6 +331,30 @@ def load_card_details_df(con) -> pd.DataFrame:
     ).df()
 
 
+def load_account_settings_df(con) -> pd.DataFrame:
+    return con.execute(
+        "SELECT account_id, excluded, category FROM account_settings"
+    ).df()
+
+
+def upsert_account_settings(con, account_id: str, excluded=None, category=None) -> None:
+    """Partial update of per-account settings; unspecified fields keep their value."""
+    con.execute(
+        "INSERT INTO account_settings (account_id) VALUES (?) ON CONFLICT (account_id) DO NOTHING",
+        [account_id],
+    )
+    if excluded is not None:
+        con.execute(
+            "UPDATE account_settings SET excluded = ? WHERE account_id = ?",
+            [bool(excluded), account_id],
+        )
+    if category is not None:
+        con.execute(
+            "UPDATE account_settings SET category = ? WHERE account_id = ?",
+            [category, account_id],
+        )
+
+
 def upsert_prices(con, prices: Dict[str, float], source: str = "yfinance") -> int:
     now = datetime.now()
     rows = [(sym.upper(), float(p), now, source) for sym, p in prices.items()]
@@ -375,8 +424,115 @@ def upsert_plaid_item(con, item_id: str, access_token: str, institution: str) ->
 
 def load_plaid_items(con) -> pd.DataFrame:
     return con.execute(
-        "SELECT item_id, institution, created_at FROM plaid_items ORDER BY created_at"
+        "SELECT item_id, institution, alias, created_at FROM plaid_items ORDER BY created_at"
     ).df()
+
+
+def set_plaid_alias(con, item_id: str, alias: str | None) -> None:
+    con.execute(
+        "UPDATE plaid_items SET alias = ? WHERE item_id = ?",
+        [(alias or None), item_id],
+    )
+
+
+def get_plaid_item(con, item_id: str) -> dict | None:
+    row = con.execute(
+        "SELECT item_id, institution, alias FROM plaid_items WHERE item_id = ?", [item_id]
+    ).fetchone()
+    if not row:
+        return None
+    return {"item_id": row[0], "institution": row[1], "alias": row[2]}
+
+
+def unique_institution(con, base: str) -> str:
+    """Return `base`, or 'base (2)', 'base (3)'… so two same-bank Plaid logins
+    don't share an account namespace."""
+    existing = {
+        r[0] for r in con.execute("SELECT institution FROM plaid_items").fetchall()
+    }
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base} ({n})" in existing:
+        n += 1
+    return f"{base} ({n})"
+
+
+def tag_accounts_with_item(con, account_ids: Iterable[str], item_id: str) -> None:
+    ids = list(account_ids)
+    if not ids:
+        return
+    placeholders = ",".join(["?"] * len(ids))
+    con.execute(
+        f"UPDATE accounts SET item_id = ? WHERE account_id IN ({placeholders})",
+        [item_id, *ids],
+    )
+
+
+def accounts_for_item(con, item_id: str) -> pd.DataFrame:
+    return con.execute(
+        "SELECT account_id, institution, name, type FROM accounts WHERE item_id = ?",
+        [item_id],
+    ).df()
+
+
+def renamespace_item_accounts(con, item_id: str, new_institution: str) -> int:
+    """Re-slug every account belonging to a Plaid item under a new institution
+    namespace (keeps each account's name/type). Returns count re-namespaced."""
+    df = accounts_for_item(con, item_id)
+    count = 0
+    for _, row in df.iterrows():
+        if row["institution"] == new_institution:
+            continue
+        rename_account(con, row["account_id"], new_institution, row["name"], row["type"])
+        count += 1
+    return count
+
+
+def _backfill_item_links(con) -> None:
+    """One-time: link pre-existing Plaid accounts (imported before item_id existed)
+    to their item by institution match, then align them to each item's namespace
+    (alias or institution). Restricted to plaid-sourced accounts so manual/file
+    accounts aren't mislinked."""
+    items = con.execute("SELECT item_id, institution, alias FROM plaid_items").fetchall()
+    for item_id, institution, alias in items:
+        con.execute(
+            """
+            UPDATE accounts SET item_id = ?
+            WHERE item_id IS NULL
+              AND institution IN (?, ?)
+              AND account_id IN (
+                  SELECT account_id FROM balances WHERE source = 'plaid'
+                  UNION
+                  SELECT account_id FROM holdings WHERE source = 'plaid'
+              )
+            """,
+            [item_id, institution, alias or institution],
+        )
+        renamespace_item_accounts(con, item_id, alias or institution)
+
+
+def get_meta(con, key: str) -> str | None:
+    row = con.execute("SELECT value FROM meta WHERE key = ?", [key]).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(con, key: str, value: str) -> None:
+    con.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [key, value],
+    )
+
+
+def touch_plaid_refresh(con) -> None:
+    """Record the current timestamp as the last time any Plaid item was refreshed."""
+    set_meta(con, "plaid_last_refresh", datetime.now().isoformat())
+
+
+def get_plaid_last_refresh(con) -> datetime | None:
+    val = get_meta(con, "plaid_last_refresh")
+    return datetime.fromisoformat(val) if val else None
 
 
 def get_plaid_access_token(con, item_id: str) -> str | None:
@@ -412,6 +568,9 @@ def delete_plaid_connection(con, item_id: str, institution: str) -> None:
     con.execute(
         "DELETE FROM card_details WHERE account_id LIKE ?", [like]
     )
+    con.execute(
+        "DELETE FROM account_settings WHERE account_id LIKE ?", [like]
+    )
     # Drop now-empty accounts for this institution.
     con.execute(
         """
@@ -433,6 +592,9 @@ def rename_account(con, old_account_id: str, institution: str, name: str, accoun
     from app.models import make_account_id
     new_id = make_account_id(institution, name)
     now = datetime.now()
+    # Preserve the Plaid item link across the slug change.
+    row = con.execute("SELECT item_id FROM accounts WHERE account_id = ?", [old_account_id]).fetchone()
+    item_id = row[0] if row else None
     if new_id != old_account_id:
         con.execute(
             "UPDATE holdings SET account_id = ? WHERE account_id = ?", [new_id, old_account_id]
@@ -440,17 +602,30 @@ def rename_account(con, old_account_id: str, institution: str, name: str, accoun
         con.execute(
             "UPDATE balances SET account_id = ? WHERE account_id = ?", [new_id, old_account_id]
         )
+        # Carry user settings + card detail across the slug change (DuckDB has no
+        # UPDATE OR REPLACE, so clear any row already at the new id, then move).
+        con.execute("DELETE FROM account_settings WHERE account_id = ?", [new_id])
+        con.execute(
+            "UPDATE account_settings SET account_id = ? WHERE account_id = ?",
+            [new_id, old_account_id],
+        )
+        con.execute("DELETE FROM card_details WHERE account_id = ?", [new_id])
+        con.execute(
+            "UPDATE card_details SET account_id = ? WHERE account_id = ?",
+            [new_id, old_account_id],
+        )
     con.execute(
         """
-        INSERT INTO accounts (account_id, institution, name, type, currency, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'USD', ?, ?)
+        INSERT INTO accounts (account_id, institution, name, type, currency, item_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'USD', ?, ?, ?)
         ON CONFLICT (account_id) DO UPDATE SET
             institution = excluded.institution,
             name        = excluded.name,
             type        = excluded.type,
+            item_id     = excluded.item_id,
             updated_at  = excluded.updated_at
         """,
-        [new_id, institution, name, account_type, now, now],
+        [new_id, institution, name, account_type, item_id, now, now],
     )
     if new_id != old_account_id:
         con.execute("DELETE FROM accounts WHERE account_id = ?", [old_account_id])

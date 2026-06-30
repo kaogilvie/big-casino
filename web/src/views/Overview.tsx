@@ -13,7 +13,7 @@ import type { Portfolio } from "@/lib/api";
 import { Card, CardContent, CardTitle } from "@/components/ui/card";
 import { DataTable } from "@/components/DataTable";
 import { Metric } from "@/components/Metric";
-import { money, moneyParen } from "@/lib/utils";
+import { money, moneyParen, typeLabel } from "@/lib/utils";
 
 const AMBER = "#FCA917";
 const BLUE = "#00B2FF";
@@ -43,10 +43,10 @@ export function Overview({ data }: { data: Portfolio }) {
   const acctData = accounts
     .map((a) => {
       const full = `${a.institution ?? "?"} · ${a.name ?? a.account_id}`;
-      const label = full.length > 34 ? full.slice(0, 33) + "…" : full;
       const isLiab = a.type === "credit_card";
+      const isRobo = a.type === "robo_broker";
       const value = isLiab ? -Math.abs(a.balance) : a.total_value;
-      return { label, value, isLiab };
+      return { label: full, value, isLiab, isRobo };
     })
     .filter((d) => d.value !== 0)
     .sort((a, b) => a.value - b.value);
@@ -58,10 +58,10 @@ export function Overview({ data }: { data: Portfolio }) {
         <Metric label="Investments" value={money(summary.investments)} />
         <Metric label="Cash" value={money(summary.cash)} />
         <Metric
-          label="Unrealized gain/loss"
-          value={money(summary.unrealized)}
-          delta={summary.cost_basis ? `${summary.unrealized_pct.toFixed(2)}%` : undefined}
-          positive={summary.unrealized >= 0}
+          label="Credit card balance"
+          value={money(-Math.abs(summary.liabilities))}
+          positive={false}
+          valueRed
         />
       </div>
 
@@ -87,6 +87,8 @@ export function Overview({ data }: { data: Portfolio }) {
                 <Tooltip
                   formatter={(v: any) => money(Number(v))}
                   contentStyle={{ background: "#161616", border: "1px solid #3E3E3E" }}
+                  labelStyle={{ color: "#ffffff" }}
+                  itemStyle={{ color: "#ffffff" }}
                 />
               </PieChart>
             </ResponsiveContainer>
@@ -102,7 +104,7 @@ export function Overview({ data }: { data: Portfolio }) {
                 <YAxis
                   type="category"
                   dataKey="label"
-                  width={210}
+                  width={280}
                   stroke="#9A9A9A"
                   fontSize={11}
                   interval={0}
@@ -110,11 +112,13 @@ export function Overview({ data }: { data: Portfolio }) {
                 <Tooltip
                   formatter={(v: any) => money(Number(v))}
                   contentStyle={{ background: "#161616", border: "1px solid #3E3E3E" }}
+                  labelStyle={{ color: "#ffffff" }}
+                  itemStyle={{ color: "#ffffff" }}
                   cursor={{ fill: "#ffffff10" }}
                 />
                 <Bar dataKey="value" isAnimationActive={false}>
                   {acctData.map((d, i) => (
-                    <Cell key={i} fill={d.isLiab ? RED : d.value > 0 ? AMBER : BLUE} />
+                    <Cell key={i} fill={d.isLiab ? RED : (d.isRobo || d.value <= 0) ? BLUE : AMBER} />
                   ))}
                 </Bar>
               </BarChart>
@@ -134,7 +138,7 @@ export function Overview({ data }: { data: Portfolio }) {
                 header: "Account",
                 render: (b) => `${b.institution ?? "?"} · ${b.name ?? b.account_id}`,
               },
-              { key: "type", header: "Type" },
+              { key: "type", header: "Type", render: (b) => typeLabel(b.type) },
               {
                 key: "balance",
                 header: "Balance",

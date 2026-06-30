@@ -73,27 +73,35 @@ def totals(enriched_holdings: pd.DataFrame, balances: pd.DataFrame) -> Dict[str,
     Liability accounts (e.g. credit cards) subtract from net worth; their cash
     balance is treated as the amount owed.
     """
+    robo_cash = 0.0
+    if not enriched_holdings.empty and "type" in enriched_holdings.columns:
+        is_robo = enriched_holdings["type"] == "robo_broker"
+        robo_cash = float(enriched_holdings.loc[is_robo, "market_value"].sum(skipna=True))
+        true_holdings = enriched_holdings[~is_robo]
+    else:
+        true_holdings = enriched_holdings
+
     investments = (
-        float(enriched_holdings["market_value"].sum(skipna=True))
-        if not enriched_holdings.empty
+        float(true_holdings["market_value"].sum(skipna=True))
+        if not true_holdings.empty
         else 0.0
     )
     cost_basis = (
-        float(enriched_holdings["cost_basis"].sum(skipna=True))
-        if not enriched_holdings.empty
+        float(true_holdings["cost_basis"].sum(skipna=True))
+        if not true_holdings.empty
         else 0.0
     )
     unrealized = investments - cost_basis
     unrealized_pct = (unrealized / cost_basis * 100.0) if cost_basis else 0.0
 
-    cash = 0.0
+    cash = robo_cash
     liabilities = 0.0
     if not balances.empty:
         bt = balances.copy()
         if "type" not in bt.columns:
             bt["type"] = "brokerage"
         is_liab = bt["type"].isin(LIABILITY_TYPES)
-        cash = float(bt.loc[~is_liab, "balance"].sum())
+        cash += float(bt.loc[~is_liab, "balance"].sum())
         liabilities = float(bt.loc[is_liab, "balance"].sum())
 
     net_worth = investments + cash - liabilities

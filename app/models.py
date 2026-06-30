@@ -22,7 +22,7 @@ from typing import List, Optional
 CASH_SYMBOL = "CASH"
 
 # Account types. Liabilities (e.g. credit cards) are netted out, not added.
-ACCOUNT_TYPES = ("brokerage", "bank", "credit_card", "retirement")
+ACCOUNT_TYPES = ("brokerage", "bank", "credit_card", "retirement", "taxes", "robo_broker")
 LIABILITY_TYPES = ("credit_card",)
 
 

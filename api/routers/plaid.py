@@ -27,6 +27,10 @@ class ExchangeBody(BaseModel):
     institution: str = "Unknown"
 
 
+class AliasBody(BaseModel):
+    alias: str | None = None
+
+
 @router.get("/status")
 def status():
     return {"configured": plaid_cfg.is_configured()}
@@ -48,11 +52,25 @@ def exchange(body: ExchangeBody):
     try:
         client = plaid_cfg.get_client()
         item_id, access_token = exchange_public_token(client, body.public_token)
-        result = PlaidItemSource(client, access_token, body.institution).fetch()
+        # Decide the account namespace before importing. A brand-new login at an
+        # already-connected bank (e.g. a 2nd Chase) gets a unique namespace
+        # ("Chase (2)") so its accounts don't collide with the first.
         with services.locked() as con:
-            db.upsert_plaid_item(con, item_id, access_token, body.institution)
+            existing = db.get_plaid_item(con, item_id)
+            if existing:
+                namespace = existing["alias"] or existing["institution"]
+                db.upsert_plaid_item(con, item_id, access_token, existing["institution"])
+            else:
+                namespace = db.unique_institution(con, body.institution)
+                db.upsert_plaid_item(con, item_id, access_token, namespace)
+        result = PlaidItemSource(client, access_token, namespace).fetch()
+        with services.locked() as con:
             summary = services.persist(con, result)
-        return {"item_id": item_id, "institution": body.institution, "summary": summary}
+            db.tag_accounts_with_item(con, [a.account_id for a in result.accounts], item_id)
+            db.touch_plaid_refresh(con)
+        return {"item_id": item_id, "institution": namespace, "summary": summary}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Plaid connection failed: {exc}")
 
@@ -63,25 +81,80 @@ def items():
         return {"items": records(db.load_plaid_items(con))}
 
 
+@router.patch("/items/{item_id}")
+def set_alias(item_id: str, body: AliasBody):
+    """Set/clear a connection alias. The alias is the account namespace, so
+    changing it re-slugs every account belonging to this connection (e.g.
+    'Chase (2)' -> 'Chase Business' -> chase_business__*)."""
+    alias = (body.alias or "").strip() or None
+    with services.locked() as con:
+        item = db.get_plaid_item(con, item_id)
+        if item is None:
+            raise HTTPException(404, "Unknown item")
+        old_ns = item["alias"] or item["institution"]
+        new_ns = alias or item["institution"]
+        db.set_plaid_alias(con, item_id, alias)
+        renamed = db.renamespace_item_accounts(con, item_id, new_ns) if new_ns != old_ns else 0
+    return {"ok": True, "alias": alias, "renamed": renamed}
+
+
 @router.post("/items/{item_id}/refresh")
 def refresh(item_id: str):
     with services.locked() as con:
         token = db.get_plaid_access_token(con, item_id)
-        row = db.load_plaid_items(con)
-        if token is None:
+        item = db.get_plaid_item(con, item_id)
+        if token is None or item is None:
             raise HTTPException(404, "Unknown item")
-        institution = "Unknown"
-        match = row[row["item_id"] == item_id]
-        if not match.empty:
-            institution = match.iloc[0]["institution"]
+        namespace = item["alias"] or item["institution"]
     try:
         client = plaid_cfg.get_client()
-        result = PlaidItemSource(client, token, institution).fetch()
+        result = PlaidItemSource(client, token, namespace).fetch()
         with services.locked() as con:
             summary = services.persist(con, result)
-        return {"institution": institution, "summary": summary}
+            db.tag_accounts_with_item(con, [a.account_id for a in result.accounts], item_id)
+            db.touch_plaid_refresh(con)
+        return {"institution": namespace, "summary": summary}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Refresh failed: {exc}")
+
+
+@router.post("/refresh-all")
+def refresh_all():
+    """Refresh every connected Plaid item in sequence."""
+    if not plaid_cfg.is_configured():
+        raise HTTPException(400, "Plaid not configured")
+    with services.locked() as con:
+        items_df = db.load_plaid_items(con)
+    if items_df.empty:
+        return {"refreshed": 0, "errors": []}
+
+    client = plaid_cfg.get_client()
+    refreshed = 0
+    errors = []
+    for _, row in items_df.iterrows():
+        item_id = row["item_id"]
+        alias = row["alias"] if row["alias"] and str(row["alias"]) != "nan" else None
+        with services.locked() as con:
+            token = db.get_plaid_access_token(con, item_id)
+            namespace = alias or row["institution"]
+        if not token:
+            continue
+        try:
+            result = PlaidItemSource(client, token, namespace).fetch()
+            with services.locked() as con:
+                services.persist(con, result)
+                db.tag_accounts_with_item(con, [a.account_id for a in result.accounts], item_id)
+            refreshed += 1
+        except Exception as exc:
+            errors.append({"item_id": item_id, "institution": namespace, "error": str(exc)})
+
+    if refreshed > 0:
+        with services.locked() as con:
+            db.touch_plaid_refresh(con)
+
+    return {"refreshed": refreshed, "errors": errors}
 
 
 @router.delete("/items/{item_id}")

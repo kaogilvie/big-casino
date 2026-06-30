@@ -19,6 +19,17 @@ export interface AccountRow {
   holdings_value: number;
   balance: number;
   total_value: number;
+  category?: string;
+  excluded?: boolean;
+}
+
+export interface ManagedAccount {
+  account_id: string;
+  institution: string;
+  name: string;
+  type: string;
+  excluded: boolean;
+  category: string;
 }
 
 export interface HoldingRow {
@@ -63,11 +74,13 @@ export interface Portfolio {
   balances: BalanceRow[];
   cards: CardRow[];
   prices_as_of: string | null;
+  plaid_last_refresh: string | null;
 }
 
 export interface PlaidItem {
   item_id: string;
   institution: string | null;
+  alias: string | null;
   created_at: string | null;
 }
 
@@ -80,8 +93,18 @@ async function j<T>(res: Response): Promise<T> {
 }
 
 export const api = {
-  portfolio: (includeRetirement: boolean) =>
-    fetch(`/api/portfolio?include_retirement=${includeRetirement}`).then((r) => j<Portfolio>(r)),
+  portfolio: (includeRetirement: boolean, category: string = "all", hideTaxes: boolean = false) =>
+    fetch(`/api/portfolio?include_retirement=${includeRetirement}&category=${category}&hide_taxes=${hideTaxes}`).then((r) =>
+      j<Portfolio>(r)
+    ),
+
+  listAccounts: () => fetch("/api/accounts").then((r) => j<{ accounts: ManagedAccount[] }>(r)),
+  updateAccountSettings: (accountId: string, body: { excluded?: boolean; category?: string }) =>
+    fetch(`/api/accounts/${encodeURIComponent(accountId)}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => j(r)),
 
   refreshPrices: () => fetch("/api/refresh-prices", { method: "POST" }).then((r) => j(r)),
   clear: () => fetch("/api/clear", { method: "POST" }).then((r) => j(r)),
@@ -98,8 +121,18 @@ export const api = {
     }).then((r) => j<{ summary: string }>(r)),
   plaidRefresh: (itemId: string) =>
     fetch(`/api/plaid/items/${itemId}/refresh`, { method: "POST" }).then((r) => j<{ summary: string }>(r)),
+  plaidSetAlias: (itemId: string, alias: string) =>
+    fetch(`/api/plaid/items/${itemId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alias }),
+    }).then((r) => j<{ alias: string | null }>(r)),
   plaidDelete: (itemId: string) =>
     fetch(`/api/plaid/items/${itemId}`, { method: "DELETE" }).then((r) => j(r)),
+  plaidRefreshAll: () =>
+    fetch("/api/plaid/refresh-all", { method: "POST" }).then((r) =>
+      j<{ refreshed: number; errors: { institution: string; error: string }[] }>(r)
+    ),
 
   importFile: (endpoint: string, form: FormData) =>
     fetch(`/api/import/${endpoint}`, { method: "POST", body: form }).then((r) => j<{ summary: string }>(r)),
@@ -129,4 +162,4 @@ export interface ManualRow {
   purchase_date: string;
 }
 
-export const ACCOUNT_TYPES = ["brokerage", "bank", "credit_card", "retirement"];
+export const ACCOUNT_TYPES = ["brokerage", "bank", "credit_card", "retirement", "taxes", "robo_broker"];
